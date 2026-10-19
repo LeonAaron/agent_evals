@@ -6,4 +6,4 @@ RUN apt-get update \
 
 WORKDIR /app
 
-COPY logic.py app/logic.py
+COPY logic.py /app/logic.py
