@@ -1,6 +1,6 @@
 # Fix the method
 
-The `snap(input: List[int])` function in `/app/logic.py` returns the wrong result.
+The `snap(input: list[int])` function in `/app/logic.py` returns the wrong result.
 
 Update it so it returns a list containing the lowest half (rounded down) of the integers in the input list.
 
