@@ -2,13 +2,14 @@ schema_version = "1.4"
 artifacts = []
 
 [task]
-name = "COMP590H/webp_variable-rename"
+name = "COMP590H/variable-rename"
 version = "1.0.0"
 description = ""
 authors = []
 keywords = []
 
 [metadata]
+author_name = "Jayden Webb"
 
 [verifier]
 timeout_sec = 600.0
