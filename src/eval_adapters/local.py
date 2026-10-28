@@ -1,9 +1,11 @@
 """Install any agent from the sibling CLI project into a Harbor task sandbox."""
 
+import json
 import shlex
 import shutil
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import Any
 
 from dotenv import dotenv_values
 from harbor.agents.installed.base import BaseInstalledAgent
@@ -47,6 +49,43 @@ def stage_package(package_path: Path, destination: Path) -> None:
         destination / "src",
         ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo", ".env", ".env.*"),
     )
+
+
+def build_trajectory(
+    instruction: str, turns: list[dict[str, Any]], model: str | None
+) -> dict[str, Any]:
+    """Convert agent TRACE turns into an ATIF trajectory for Harbor's Trajectory and Tokens UI."""
+    steps: list[dict[str, Any]] = [{"step_id": 1, "source": "user", "message": instruction}]
+    for step_id, turn in enumerate(turns, start=2):
+        ids = [f"call_{step_id}_{n}" for n in range(len(turn["commands"]))]
+        step: dict[str, Any] = {"step_id": step_id, "source": "agent", "message": turn["text"]}
+        step["metrics"] = dict(
+            zip(
+                ("prompt_tokens", "cached_tokens", "completion_tokens"), turn["tokens"], strict=True
+            )
+        )
+        if turn["commands"]:
+            pairs = list(zip(ids, turn["commands"], strict=True))
+            step["tool_calls"] = [
+                {"tool_call_id": i, "function_name": "shell", "arguments": {"command": c}}
+                for i, (c, _) in pairs
+            ]
+            step["observation"] = {
+                "results": [{"source_call_id": i, "content": out} for i, (_, out) in pairs]
+            }
+        steps.append(step)
+    totals = [sum(column) for column in zip(*(t["tokens"] for t in turns), strict=True)]
+    return {
+        "schema_version": "ATIF-v1.8",
+        "agent": {"name": "local-cli-agent", "version": "1", "model_name": model},
+        "steps": steps,
+        "final_metrics": {
+            "total_prompt_tokens": totals[0],
+            "total_cached_tokens": totals[1],
+            "total_completion_tokens": totals[2],
+            "total_steps": len(steps),
+        },
+    }
 
 
 class LocalCliAgent(BaseInstalledAgent):
@@ -107,6 +146,19 @@ class LocalCliAgent(BaseInstalledAgent):
             cwd=environment.task_env_config.workdir,
         )
         self.logs_dir.mkdir(parents=True, exist_ok=True)
-        (self.logs_dir / "stdout.txt").write_text(result.stdout or "")
-        (self.logs_dir / "stderr.txt").write_text(result.stderr or "")
+        (self.logs_dir / "stdout.txt").write_text(result.stdout or "", encoding="utf-8")
+        (self.logs_dir / "stderr.txt").write_text(result.stderr or "", encoding="utf-8")
+        # Read "TRACE {...}" lines printed by agents (Docker exec may merge stderr into stdout)
+        turns = [
+            json.loads(line.removeprefix("TRACE "))
+            for line in f"{result.stdout or ''}\n{result.stderr or ''}".splitlines()
+            if line.startswith("TRACE ")
+        ]
+        if turns:
+            totals = [sum(column) for column in zip(*(t["tokens"] for t in turns), strict=True)]
+            context.n_input_tokens, context.n_cache_tokens, context.n_output_tokens = totals
+            trajectory = build_trajectory(instruction, turns, self.model_name)
+            (self.logs_dir / "trajectory.json").write_text(
+                json.dumps(trajectory, indent=2), encoding="utf-8"
+            )
         context.metadata = {"agent": self.options.agent}

@@ -137,3 +137,21 @@ def test_run_quotes_instruction_and_forwards_model_and_environment(
 def test_missing_package_fails_before_environment_setup(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="package_path"):
         stage_package(tmp_path / "missing", tmp_path)
+
+
+def test_trace_lines_become_a_valid_atif_trajectory() -> None:
+    from harbor.models.trajectories.trajectory import Trajectory
+
+    from eval_adapters.local import build_trajectory
+
+    turns = [
+        {"tokens": [10, 4, 3], "text": "", "commands": [["ls", "a.py\n(exit code 0)"]]},
+        {"tokens": [20, 0, 5], "text": "Done.", "commands": []},
+    ]
+    trajectory = Trajectory.model_validate(build_trajectory("Fix it", turns, "gpt"))
+
+    assert [step.source for step in trajectory.steps] == ["user", "agent", "agent"]
+    assert trajectory.steps[1].tool_calls[0].arguments == {"command": "ls"}  # type: ignore[index]
+    assert trajectory.final_metrics is not None
+    assert trajectory.final_metrics.total_prompt_tokens == 30
+    assert trajectory.final_metrics.total_completion_tokens == 8
