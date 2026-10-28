@@ -2,7 +2,7 @@ schema_version = "1.4"
 artifacts = []
 
 [task]
-name = "COMP590H/variable-rename"
+name = "local/webp_variable_rename"
 version = "1.0.0"
 description = ""
 authors = []
