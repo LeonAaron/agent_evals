@@ -1,6 +1,7 @@
 """Check local packaging, CLI forwarding, and credential handling without Docker."""
 
 import asyncio
+import json
 import shlex
 from pathlib import Path
 from typing import cast
@@ -9,8 +10,9 @@ import pytest
 from harbor.environments.base import BaseEnvironment, ExecResult
 from harbor.models.agent.context import AgentContext
 from harbor.models.task.config import EnvironmentConfig
+from harbor.models.trajectories import Trajectory
 
-from eval_adapters.local import LocalCliAgent, stage_package
+from eval_adapters.local import LocalCliAgent, build_trajectory, stage_package
 
 
 @pytest.fixture(params=["package", "package with spaces"])
@@ -114,6 +116,7 @@ def test_run_quotes_instruction_and_forwards_model_and_environment(
         assert env == {
             "EXAMPLE_API_KEY": "explicit-override",
             "OTHER_SETTING": "preserved",
+            "AGENTS590_LOG_DIR": "/logs/agent",
             "AGENTS590_ATIF_PATH": "/logs/agent/trajectory.json",
         }
         assert cwd == "/app"
@@ -135,7 +138,9 @@ def test_run_quotes_instruction_and_forwards_model_and_environment(
         ]
     ]
     assert (agent.logs_dir / "stdout.txt").read_text() == "agent result\n"
-    assert context.metadata is None
+    assert context.is_empty()
+    agent.populate_context_post_run(context)
+    assert context.metadata == {"agent": "another-agent"}
 
 
 def test_missing_package_fails_before_environment_setup(tmp_path: Path) -> None:
@@ -159,3 +164,70 @@ def test_trace_lines_become_a_valid_atif_trajectory() -> None:
     assert trajectory.final_metrics is not None
     assert trajectory.final_metrics.total_prompt_tokens == 30
     assert trajectory.final_metrics.total_completion_tokens == 8
+
+
+TRACE_TURN = {"tokens": [3, 1, 2], "text": "done", "commands": [["ls", "ok"]]}
+
+
+def run_with_output(
+    agent: LocalCliAgent, stdout: str, stderr: str, monkeypatch: pytest.MonkeyPatch
+) -> AgentContext:
+    async def execute(
+        environment: BaseEnvironment, command: str, env: dict[str, str], cwd: str | None = None
+    ) -> ExecResult:
+        return ExecResult(return_code=0, stdout=stdout, stderr=stderr)
+
+    monkeypatch.setattr(agent, "exec_as_agent", execute)
+    context = AgentContext()
+    environment = cast(BaseEnvironment, RecordingEnvironment())
+    asyncio.run(agent.run("Do it", environment, context))
+    agent.populate_context_post_run(context)
+    return context
+
+
+def test_malformed_trace_records_do_not_fail_the_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    agent = LocalCliAgent(logs_dir=tmp_path, agent="some-agent")
+    stdout = f"TRACE {{malformed}}\nTRACE 1\nTRACE {json.dumps(TRACE_TURN)}\n"
+
+    context = run_with_output(agent, stdout, 'TRACE {"tokens": [1]}\n', monkeypatch)
+
+    assert (context.n_input_tokens, context.n_cache_tokens, context.n_output_tokens) == (3, 1, 2)
+    assert len(json.loads((tmp_path / "trajectory.json").read_text())["steps"]) == 2
+
+
+def test_only_malformed_trace_records_leave_no_trajectory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    agent = LocalCliAgent(logs_dir=tmp_path, agent="some-agent")
+
+    context = run_with_output(agent, "TRACE {malformed}\n", "", monkeypatch)
+
+    assert context.n_input_tokens is None
+    assert not (tmp_path / "trajectory.json").exists()
+
+
+def test_native_trajectory_and_cost_outrank_trace_records(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    native = build_trajectory("Do it", [{**TRACE_TURN, "tokens": [9, 0, 9]}], None)
+    native["final_metrics"]["total_cost_usd"] = 0.25
+    (tmp_path / "trajectory.json").write_text(json.dumps(native))
+    agent = LocalCliAgent(logs_dir=tmp_path, agent="some-agent")
+
+    context = run_with_output(agent, f"TRACE {json.dumps(TRACE_TURN)}\n", "", monkeypatch)
+
+    assert (context.n_input_tokens, context.cost_usd) == (9, 0.25)
+
+
+def test_event_journal_outranks_trace_records(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    journal = build_trajectory("Do it", [{**TRACE_TURN, "tokens": [7, 0, 7]}], None)
+    agent = LocalCliAgent(logs_dir=tmp_path, agent="some-agent")
+    monkeypatch.setattr(agent, "convert_trajectory", lambda _: Trajectory.model_validate(journal))
+
+    context = run_with_output(agent, f"TRACE {json.dumps(TRACE_TURN)}\n", "", monkeypatch)
+
+    assert context.n_input_tokens == 7
